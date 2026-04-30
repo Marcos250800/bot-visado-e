@@ -12,7 +12,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
 
     steps:
       - name: 📥 Clonar repositorio
@@ -46,7 +46,10 @@ jobs:
           path: |
             captura.png
             captura_error.png
+            debug_paso1.png
+            debug_paso2.png
             debug_paso3.png
+            debug_paso4_pre.png
           if-no-files-found: ignore
           retention-days: 3
 
