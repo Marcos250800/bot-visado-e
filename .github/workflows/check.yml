@@ -46,6 +46,7 @@ jobs:
           path: |
             captura.png
             captura_error.png
+            debug_paso3.png
           if-no-files-found: ignore
           retention-days: 3
 
