@@ -2,39 +2,34 @@
 Monitor de citas - Visado Nacional de Estudios
 Consulado General de España en La Habana (Cuba)
 
-v6: Sobreescribe window.alert ANTES de que cargue la página
-- alert("Welcome / Bienvenido") se acepta automáticamente vía init_script
-- El botón "Continue / Continuar" aparece inmediatamente después
+v7 FINAL: Llamada directa a la API de Bookitit
+- Sin navegador, sin Playwright, sin Cloudflare
+- Consulta el endpoint datetime/ que devuelve fechas con huecos
+- state=1 + times con freeSlots = HAY CITAS
+- state=0 + times vacío = SIN CITAS
 """
 
 import os
 import sys
-import asyncio
+import json
+import re
 import requests
-from pathlib import Path
-from datetime import datetime
-from playwright.async_api import async_playwright
+from datetime import datetime, timedelta
 
 # ===== Configuración =====
-URL_INICIO = (
-    "https://www.exteriores.gob.es/Consulados/lahabana/es/"
-    "ServiciosConsulares/Paginas/index.aspx"
-    "?scco=Cuba&scd=166&scca=Visados&scs=Visados+Nacionales+-+Visado+de+estudios"
-)
-
-TEXTO_ENLACE = "Reservar cita de visado estudio"
-
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN_VISADO")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID_VISADO")
 
-CAPTURA = Path("captura.png")
-CAPTURA_ERROR = Path("captura_error.png")
-ESTADO_FILE = Path("ultimo_estado.txt")
+PUBLIC_KEY = "2ac9fec388c03f817a21771d720ff4261"
+SERVICE_ID = "bkt873070"
+AGENDA_ID = "bkt285318"
+
+API_URL = "https://www.citaconsular.es/onlinebookings/datetime/"
+ESTADO_FILE = "ultimo_estado.txt"
 
 
 def log(msg):
-    ahora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    print(f"[{ahora}] {msg}", flush=True)
+    print(f"[{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}] {msg}", flush=True)
 
 
 def enviar_telegram(texto):
@@ -47,237 +42,185 @@ def enviar_telegram(texto):
             data={"chat_id": TG_CHAT, "text": texto, "parse_mode": "HTML"},
             timeout=15,
         )
-        log(f"✅ Telegram texto: {r.status_code}")
+        log(f"✅ Telegram: {r.status_code}")
     except Exception as e:
         log(f"⚠ Error Telegram: {e}")
 
 
-def enviar_foto(ruta, caption=""):
-    if not TG_TOKEN or not TG_CHAT:
-        return
-    if not ruta.exists() or ruta.stat().st_size < 1000:
-        enviar_telegram(caption)
-        return
-    try:
-        with open(ruta, "rb") as f:
-            r = requests.post(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
-                data={"chat_id": TG_CHAT, "caption": caption[:1024], "parse_mode": "HTML"},
-                files={"photo": ("captura.png", f, "image/png")},
-                timeout=30,
-            )
-        log(f"✅ Telegram foto: {r.status_code}")
-    except Exception as e:
-        log(f"⚠ Error Telegram foto: {e}")
-
-
 def leer_estado():
-    if ESTADO_FILE.exists():
-        return ESTADO_FILE.read_text(encoding="utf-8").strip()
-    return ""
+    try:
+        with open(ESTADO_FILE, "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
 
 
 def guardar_estado(valor):
-    ESTADO_FILE.write_text(valor, encoding="utf-8")
+    with open(ESTADO_FILE, "w") as f:
+        f.write(valor)
 
 
-async def main():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-            ],
-        )
+def consultar_api():
+    """Llama al endpoint datetime/ y devuelve los Slots parseados."""
+    hoy = datetime.now()
+    inicio = hoy.strftime("%Y-%m-%d")
+    fin = (hoy + timedelta(days=60)).strftime("%Y-%m-%d")
 
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            locale="es-ES",
-            viewport={"width": 1366, "height": 768},
-        )
+    params = {
+        "callback": "cb",
+        "type": "default",
+        "publickey": PUBLIC_KEY,
+        "lang": "es",
+        "services[]": SERVICE_ID,
+        "agendas[]": AGENDA_ID,
+        "version": "4",
+        "src": f"https://www.citaconsular.es/es/hosteds/widgetdefault/{PUBLIC_KEY}/{SERVICE_ID}",
+        "srvsrc": "https://www.citaconsular.es",
+        "start": inicio,
+        "end": fin,
+        "selectedPeople": "1",
+    }
 
-        # CLAVE v6: sobreescribir window.alert ANTES de que cualquier página cargue
-        # Esto se inyecta en TODAS las páginas (incluidas las nuevas pestañas)
-        # Cuando citaconsular.es ejecute alert("Welcome / Bienvenido"),
-        # simplemente se ejecutará nuestra función vacía = auto-aceptado
-        await context.add_init_script("""
-            // Anti-detección
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'languages', { get: () => ['es-ES', 'es', 'en'] });
-            window.chrome = { runtime: {} };
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+        "Referer": "https://www.citaconsular.es/",
+        "Accept": "*/*",
+    }
 
-            // AUTO-ACEPTAR ALERT: sobreescribir window.alert para que no bloquee
-            window.alert = function(msg) {
-                console.log('Alert interceptado: ' + msg);
-                return true;
-            };
+    log(f"📡 Consultando API: {inicio} → {fin}")
+    r = requests.get(API_URL, params=params, headers=headers, timeout=20)
+    log(f"  Status: {r.status_code} | {len(r.text)} chars")
 
-            // También sobreescribir confirm por si acaso
-            window.confirm = function(msg) {
-                console.log('Confirm interceptado: ' + msg);
-                return true;
-            };
-        """)
+    if r.status_code != 200:
+        raise Exception(f"API devolvió status {r.status_code}: {r.text[:200]}")
 
-        page = await context.new_page()
+    # Extraer JSON del wrapper JSONP: cb({...});
+    texto = r.text.strip()
+    match = re.search(r'cb\((.*)\);?\s*$', texto, re.DOTALL)
+    if match:
+        return json.loads(match.group(1))
 
+    # Si no tiene wrapper, intentar parsear directo
+    return json.loads(texto)
+
+
+def analizar_slots(datos):
+    """
+    Analiza los Slots devueltos por la API.
+    Devuelve lista de fechas con citas disponibles.
+    Cada elemento: {"fecha": "2026-05-07", "horas": [{"time": "09:30", "freeSlots": 2}, ...]}
+    """
+    fechas_con_citas = []
+
+    slots = datos.get("Slots", [])
+    for slot in slots:
+        fecha = slot.get("date", "")
+        state = slot.get("state", 0)
+        times = slot.get("times", {})
+
+        # state=1 y times con contenido = HAY CITAS
+        if state == 1 and isinstance(times, dict) and len(times) > 0:
+            horas = []
+            total_huecos = 0
+            for minuto, info in times.items():
+                hora = info.get("time", "??:??")
+                free = info.get("freeSlots", 0)
+                horas.append({"time": hora, "freeSlots": free})
+                total_huecos += free
+
+            if horas:
+                fechas_con_citas.append({
+                    "fecha": fecha,
+                    "horas": sorted(horas, key=lambda x: x["time"]),
+                    "total_huecos": total_huecos,
+                })
+
+    return fechas_con_citas
+
+
+def formatear_mensaje(fechas_con_citas):
+    """Formatea el mensaje de Telegram con las fechas y horas disponibles."""
+    total_fechas = len(fechas_con_citas)
+    total_huecos = sum(f["total_huecos"] for f in fechas_con_citas)
+
+    msg = (
+        "🚨 <b>¡¡CITAS DISPONIBLES!!</b> 🚨\n\n"
+        "📌 <b>Visado de Estudios</b>\n"
+        "🏛 Consulado de España en La Habana\n\n"
+        f"📅 {total_fechas} fecha(s) con {total_huecos} huecos libres:\n\n"
+    )
+
+    for f in fechas_con_citas[:5]:  # Máximo 5 fechas para no saturar
+        # Formatear fecha bonita
         try:
-            # ─── PASO 1: abrir página del Ministerio ───
-            log("📄 Paso 1: abriendo exteriores.gob.es ...")
-            await page.goto(URL_INICIO, wait_until="domcontentloaded", timeout=60_000)
-            await page.wait_for_timeout(3_000)
-            log(f"  ✓ Cargada: {page.url}")
+            dt = datetime.strptime(f["fecha"], "%Y-%m-%d")
+            fecha_bonita = dt.strftime("%A %d/%m/%Y").capitalize()
+        except Exception:
+            fecha_bonita = f["fecha"]
 
-            # ─── PASO 2: clic en enlace → se abre pestaña nueva ───
-            log(f"🔗 Paso 2: buscando enlace '{TEXTO_ENLACE}' ...")
+        primera = f["horas"][0]["time"]
+        ultima = f["horas"][-1]["time"]
 
-            enlace = page.locator(f"a:has-text('{TEXTO_ENLACE}')")
-            count = await enlace.count()
-            log(f"  Encontrados {count} enlace(s)")
+        msg += (
+            f"  📆 <b>{fecha_bonita}</b>\n"
+            f"     ⏰ {primera} - {ultima} ({f['total_huecos']} huecos)\n\n"
+        )
 
-            if count == 0:
-                raise Exception("No se encontró el enlace de reservar cita")
+    if total_fechas > 5:
+        msg += f"  ... y {total_fechas - 5} fecha(s) más\n\n"
 
-            # El clic abrirá una pestaña nueva — esperamos a que se abra
-            async with context.expect_page(timeout=30_000) as nueva_info:
-                await enlace.first.click()
+    msg += (
+        "⚡ <b>Reserva YA antes de que las cojan</b>\n\n"
+        f"⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    )
 
-            nueva = await nueva_info.value
-            log(f"  ✓ Pestaña nueva abierta (consecuencia del clic)")
+    return msg
 
-            # Esperar a que cargue completamente
-            # El alert ya fue auto-aceptado por el init_script
-            await nueva.wait_for_load_state("load", timeout=60_000)
-            await nueva.wait_for_timeout(3_000)
-            log(f"  URL: {nueva.url}")
 
-            # ─── PASO 3: verificar que el alert se aceptó ───
-            log("🟡 Paso 3: alert Welcome/Bienvenido (auto-aceptado por init_script)")
-            await nueva.screenshot(path="debug_paso3.png", full_page=True)
-            log(f"  📸 Debug paso 3: {Path('debug_paso3.png').stat().st_size} bytes")
+def main():
+    log("🚀 Monitor de Visado de Estudios — API directa (sin navegador)")
 
-            # Verificar qué hay en la página ahora
-            contenido_paso3 = await nueva.content()
-            if "Continue" in contenido_paso3 or "Continuar" in contenido_paso3:
-                log("  ✓ Botón Continue/Continuar visible — alert aceptado correctamente")
-            elif "verificación de seguridad" in contenido_paso3.lower():
-                log("  🛑 Cloudflare detectado después del alert")
-                enviar_foto(Path("debug_paso3.png"), "🛑 <b>Cloudflare bloqueando</b>")
-                return
-            else:
-                log(f"  ⚠ Contenido inesperado ({len(contenido_paso3)} chars)")
+    try:
+        datos = consultar_api()
+    except Exception as e:
+        log(f"❌ Error consultando API: {e}")
+        enviar_telegram(f"⚠️ <b>Error API</b>\n\n<code>{str(e)[:300]}</code>")
+        return
 
-            # ─── PASO 4: botón verde "Continue / Continuar" ───
-            log("🟢 Paso 4: pulsando Continue / Continuar ...")
+    fechas_con_citas = analizar_slots(datos)
 
-            boton_encontrado = False
+    if fechas_con_citas:
+        # Crear un hash del estado actual para no repetir notificaciones
+        estado_actual = "|".join(
+            f"{f['fecha']}:{f['total_huecos']}" for f in fechas_con_citas
+        )
+        estado_anterior = leer_estado()
 
-            selectores = [
-                'button:has-text("Continue / Continuar")',
-                'button:has-text("Continuar")',
-                'button:has-text("Continue")',
-                'a:has-text("Continue / Continuar")',
-                'a:has-text("Continuar")',
-                'a:has-text("Continue")',
-                'input[value*="Continuar"]',
-                'input[value*="Continue"]',
-            ]
+        if estado_actual != estado_anterior:
+            log(f"🎉 ¡CITAS DETECTADAS! {len(fechas_con_citas)} fechas")
+            for f in fechas_con_citas:
+                log(f"  📆 {f['fecha']}: {f['total_huecos']} huecos ({len(f['horas'])} horarios)")
 
-            for sel in selectores:
-                try:
-                    loc = nueva.locator(sel).first
-                    if await loc.count() > 0 and await loc.is_visible():
-                        await loc.click(timeout=8_000)
-                        log(f"  ✓ Clic en: {sel}")
-                        boton_encontrado = True
-                        break
-                except Exception:
-                    continue
+            mensaje = formatear_mensaje(fechas_con_citas)
+            enviar_telegram(mensaje)
+            guardar_estado(estado_actual)
+        else:
+            log(f"⏸ Ya notificado ({len(fechas_con_citas)} fechas, sin cambios)")
+    else:
+        log("💤 Sin citas disponibles")
+        if leer_estado() and not leer_estado().startswith("SIN"):
+            enviar_telegram(
+                f"💤 <b>Citas agotadas</b>\n"
+                f"⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
+                f"Seguiré vigilando."
+            )
+        guardar_estado("SIN_CITAS")
 
-            if not boton_encontrado:
-                try:
-                    loc = nueva.get_by_text("Continuar", exact=False)
-                    if await loc.count() > 0:
-                        await loc.first.click(timeout=8_000)
-                        log("  ✓ Clic por get_by_text")
-                        boton_encontrado = True
-                except Exception:
-                    pass
-
-            if not boton_encontrado:
-                log("  ⚠ No se encontró botón Continuar")
-                await nueva.screenshot(path=str(CAPTURA_ERROR), full_page=True)
-                enviar_foto(CAPTURA_ERROR, "⚠️ <b>No encontró botón Continuar</b>\nRevisa captura.")
-
-            await nueva.wait_for_timeout(5_000)
-
-            # ─── PASO 5: leer calendario ───
-            log("📅 Paso 5: analizando resultado ...")
-
-            try:
-                await nueva.wait_for_load_state("networkidle", timeout=15_000)
-            except Exception:
-                pass
-
-            await nueva.wait_for_timeout(2_000)
-            contenido = await nueva.content()
-            contenido_lower = contenido.lower()
-            await nueva.screenshot(path=str(CAPTURA), full_page=True)
-            log(f"  📸 Captura: {CAPTURA.stat().st_size} bytes")
-            log(f"  URL final: {nueva.url}")
-            log(f"  Contenido: {len(contenido)} chars")
-
-            # Cloudflare
-            if "verificación de seguridad" in contenido_lower or "challenge-platform" in contenido_lower:
-                log("  🛑 Cloudflare detectado")
-                enviar_foto(CAPTURA, "🛑 <b>Cloudflare bloqueando</b>")
-                return
-
-            # ¿Hay citas?
-            tiene_hueco = "hueco libre" in contenido_lower or "huecos libres" in contenido_lower
-
-            if tiene_hueco:
-                num = contenido_lower.count("hueco libre") + contenido_lower.count("huecos libres")
-                estado_actual = f"CITAS:{num}"
-
-                if estado_actual != leer_estado():
-                    log(f"  🎉 ¡CITAS DETECTADAS! ({num} bloques)")
-                    enviar_foto(
-                        CAPTURA,
-                        f"🎉 <b>¡HAY CITAS DISPONIBLES!</b>\n\n"
-                        f"📌 Visado de Estudios - Consulado La Habana\n"
-                        f"🟢 {num} bloques con huecos libres\n\n"
-                        f"⚡ Reserva ya antes de que las cojan",
-                    )
-                    guardar_estado(estado_actual)
-                else:
-                    log(f"  ⏸ Ya notificado ({num} bloques)")
-            else:
-                log("  💤 Sin citas disponibles")
-                if leer_estado().startswith("CITAS:"):
-                    enviar_telegram("💤 <b>Citas agotadas</b>. Seguiré vigilando.")
-                    guardar_estado("SIN_CITAS")
-
-        except Exception as e:
-            log(f"❌ Error: {e}")
-            try:
-                await page.screenshot(path=str(CAPTURA_ERROR), full_page=True)
-            except Exception:
-                pass
-            enviar_foto(CAPTURA_ERROR, f"⚠️ <b>Error</b>\n\n<code>{str(e)[:300]}</code>")
-        finally:
-            await context.close()
-            await browser.close()
+    log("✅ Finalizado")
 
 
 if __name__ == "__main__":
     if not TG_TOKEN or not TG_CHAT:
         log("❌ Faltan secrets TELEGRAM_BOT_TOKEN_VISADO y TELEGRAM_CHAT_ID_VISADO")
         sys.exit(1)
-    asyncio.run(main())
+    main()
