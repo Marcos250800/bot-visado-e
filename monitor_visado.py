@@ -2,11 +2,9 @@
 Monitor de citas - Visado Nacional de Estudios
 Consulado General de España en La Habana (Cuba)
 
-v5: Manejo correcto del popup alert() en pestaña nueva
-- El enlace abre pestaña nueva como consecuencia del clic
-- El handler de dialog se registra en el CONTEXTO (aplica a todas las páginas)
-- Después de aceptar el popup, pulsa "Continue / Continuar"
-- Lee calendario y detecta huecos libres
+v6: Sobreescribe window.alert ANTES de que cargue la página
+- alert("Welcome / Bienvenido") se acepta automáticamente vía init_script
+- El botón "Continue / Continuar" aparece inmediatamente después
 """
 
 import os
@@ -34,7 +32,6 @@ CAPTURA_ERROR = Path("captura_error.png")
 ESTADO_FILE = Path("ultimo_estado.txt")
 
 
-# ===== Utilidades =====
 def log(msg):
     ahora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     print(f"[{ahora}] {msg}", flush=True)
@@ -84,7 +81,6 @@ def guardar_estado(valor):
     ESTADO_FILE.write_text(valor, encoding="utf-8")
 
 
-# ===== Bot principal =====
 async def main():
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -106,38 +102,30 @@ async def main():
             viewport={"width": 1366, "height": 768},
         )
 
-        # Anti-detección
+        # CLAVE v6: sobreescribir window.alert ANTES de que cualquier página cargue
+        # Esto se inyecta en TODAS las páginas (incluidas las nuevas pestañas)
+        # Cuando citaconsular.es ejecute alert("Welcome / Bienvenido"),
+        # simplemente se ejecutará nuestra función vacía = auto-aceptado
         await context.add_init_script("""
+            // Anti-detección
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'languages', { get: () => ['es-ES', 'es', 'en'] });
             window.chrome = { runtime: {} };
+
+            // AUTO-ACEPTAR ALERT: sobreescribir window.alert para que no bloquee
+            window.alert = function(msg) {
+                console.log('Alert interceptado: ' + msg);
+                return true;
+            };
+
+            // También sobreescribir confirm por si acaso
+            window.confirm = function(msg) {
+                console.log('Confirm interceptado: ' + msg);
+                return true;
+            };
         """)
 
-        # CLAVE: registrar handler de dialog en el CONTEXTO
-        # Así aplica a TODAS las páginas, incluidas las nuevas que se abran
-        dialog_aceptado = False
-
-        def on_page(nueva_pagina):
-            """Se ejecuta cada vez que se abre una nueva página/pestaña."""
-            async def handle_dialog(dialog):
-                nonlocal dialog_aceptado
-                log(f"  💬 Dialog en nueva página: '{dialog.message}' → Aceptar")
-                await dialog.accept()
-                dialog_aceptado = True
-            nueva_pagina.on("dialog", lambda d: asyncio.ensure_future(handle_dialog(d)))
-
-        context.on("page", on_page)
-
         page = await context.new_page()
-
-        # También registrar en la página principal por si acaso
-        async def handle_dialog_main(dialog):
-            nonlocal dialog_aceptado
-            log(f"  💬 Dialog en página principal: '{dialog.message}' → Aceptar")
-            await dialog.accept()
-            dialog_aceptado = True
-
-        page.on("dialog", lambda d: asyncio.ensure_future(handle_dialog_main(d)))
 
         try:
             # ─── PASO 1: abrir página del Ministerio ───
@@ -156,56 +144,39 @@ async def main():
             if count == 0:
                 raise Exception("No se encontró el enlace de reservar cita")
 
-            # Esperar pestaña nueva como consecuencia del clic
+            # El clic abrirá una pestaña nueva — esperamos a que se abra
             async with context.expect_page(timeout=30_000) as nueva_info:
                 await enlace.first.click()
 
             nueva = await nueva_info.value
-            log(f"  ✓ Nueva pestaña abierta (consecuencia del clic)")
+            log(f"  ✓ Pestaña nueva abierta (consecuencia del clic)")
 
-            # Registrar handler de dialog TAMBIÉN directamente en la nueva página
-            async def handle_dialog_nueva(dialog):
-                nonlocal dialog_aceptado
-                log(f"  💬 Dialog nueva pestaña: '{dialog.message}' → Aceptar")
-                await dialog.accept()
-                dialog_aceptado = True
+            # Esperar a que cargue completamente
+            # El alert ya fue auto-aceptado por el init_script
+            await nueva.wait_for_load_state("load", timeout=60_000)
+            await nueva.wait_for_timeout(3_000)
+            log(f"  URL: {nueva.url}")
 
-            nueva.on("dialog", lambda d: asyncio.ensure_future(handle_dialog_nueva(d)))
-
-            # Esperar a que cargue y el dialog se dispare
-            await nueva.wait_for_load_state("domcontentloaded", timeout=60_000)
-            await nueva.wait_for_timeout(5_000)
-            log(f"  URL nueva pestaña: {nueva.url}")
-
-            # ─── PASO 3: popup Welcome/Bienvenido ───
-            log("🟡 Paso 3: popup Welcome/Bienvenido ...")
-
-            if dialog_aceptado:
-                log("  ✓ Popup aceptado automáticamente")
-            else:
-                # Esperar un poco más por si tarda
-                log("  Esperando popup...")
-                await nueva.wait_for_timeout(5_000)
-                if dialog_aceptado:
-                    log("  ✓ Popup aceptado (tardó un poco)")
-                else:
-                    log("  ⚠ No se detectó popup, continuando...")
-
-            await nueva.wait_for_timeout(2_000)
+            # ─── PASO 3: verificar que el alert se aceptó ───
+            log("🟡 Paso 3: alert Welcome/Bienvenido (auto-aceptado por init_script)")
             await nueva.screenshot(path="debug_paso3.png", full_page=True)
             log(f"  📸 Debug paso 3: {Path('debug_paso3.png').stat().st_size} bytes")
 
+            # Verificar qué hay en la página ahora
+            contenido_paso3 = await nueva.content()
+            if "Continue" in contenido_paso3 or "Continuar" in contenido_paso3:
+                log("  ✓ Botón Continue/Continuar visible — alert aceptado correctamente")
+            elif "verificación de seguridad" in contenido_paso3.lower():
+                log("  🛑 Cloudflare detectado después del alert")
+                enviar_foto(Path("debug_paso3.png"), "🛑 <b>Cloudflare bloqueando</b>")
+                return
+            else:
+                log(f"  ⚠ Contenido inesperado ({len(contenido_paso3)} chars)")
+
             # ─── PASO 4: botón verde "Continue / Continuar" ───
-            log("🟢 Paso 4: buscando botón Continue / Continuar ...")
+            log("🟢 Paso 4: pulsando Continue / Continuar ...")
 
             boton_encontrado = False
-
-            # Esperar a que aparezca
-            try:
-                await nueva.wait_for_selector('text=/Continue|Continuar/i', timeout=15_000)
-                log("  ✓ Texto Continue/Continuar visible")
-            except Exception:
-                log("  ⚠ Texto no apareció en 15s")
 
             selectores = [
                 'button:has-text("Continue / Continuar")',
@@ -242,7 +213,7 @@ async def main():
             if not boton_encontrado:
                 log("  ⚠ No se encontró botón Continuar")
                 await nueva.screenshot(path=str(CAPTURA_ERROR), full_page=True)
-                enviar_foto(CAPTURA_ERROR, "⚠️ <b>No se encontró botón Continuar</b>\nRevisa la captura.")
+                enviar_foto(CAPTURA_ERROR, "⚠️ <b>No encontró botón Continuar</b>\nRevisa captura.")
 
             await nueva.wait_for_timeout(5_000)
 
