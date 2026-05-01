@@ -2,23 +2,20 @@ name: 🎓 Vigilar Citas Visado Estudios
 
 on:
   schedule:
-    # Cada 5 minutos (mínimo real de GitHub Actions ~5 min)
     - cron: "*/5 * * * *"
-  workflow_dispatch:  # Permite ejecutarlo manualmente desde la web
+  workflow_dispatch:
 
 permissions:
-  contents: write  # Para guardar el archivo de estado
+  contents: write
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 3
 
     steps:
       - name: 📥 Clonar repositorio
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: 🐍 Configurar Python
         uses: actions/setup-python@v5
@@ -26,34 +23,15 @@ jobs:
           python-version: "3.12"
 
       - name: 📦 Instalar dependencias
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          playwright install chromium
-          playwright install-deps chromium
+        run: pip install requests
 
-      - name: 🔍 Ejecutar bot
+      - name: 🔍 Ejecutar monitor
         env:
           TELEGRAM_BOT_TOKEN_VISADO: ${{ secrets.TELEGRAM_BOT_TOKEN_VISADO }}
           TELEGRAM_CHAT_ID_VISADO: ${{ secrets.TELEGRAM_CHAT_ID_VISADO }}
         run: python monitor_visado.py
 
-      - name: 📸 Subir capturas si las hay
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: capturas-${{ github.run_id }}
-          path: |
-            captura.png
-            captura_error.png
-            debug_paso1.png
-            debug_paso2.png
-            debug_paso3.png
-            debug_paso4_pre.png
-          if-no-files-found: ignore
-          retention-days: 3
-
-      - name: 💾 Guardar estado en el repo
+      - name: 💾 Guardar estado
         if: always()
         run: |
           git config user.name "visado-bot"
